@@ -16,7 +16,8 @@ Turns a Veracode SCA SBOM plus your Veracode SCA findings into a VEX document: o
 ## Input and output
 
 - SBOM: CycloneDX 1.4–1.6, JSON or XML, from the Veracode SBOM REST API (`type=application` / `type=agent`), with its `vulnerabilities` section. SPDX is rejected.
-- Findings: Findings REST API export with `scan_type=SCA&include_annot=TRUE`. Pass every page (`-f` is repeatable). Without findings every statement is `in_triage` / `under_investigation`.
+- Findings: Findings REST API export with `scan_type=SCA&include_annot=TRUE` (SCA must be the only scan type). Pass every page (`-f` is repeatable). Without findings every statement is `in_triage` / `under_investigation`.
+- Scope: findings default to the latest policy scan; add `context=<sandbox_guid>` for a sandbox. Export the SBOM and findings from the same app and scan context.
 - Output: CycloneDX VEX (JSON or XML, same spec version as the SBOM) or OpenVEX 0.2.0 (JSON). Inputs are never overwritten.
 - Encoding: UTF-8, or UTF-16/32 with a BOM (what PowerShell `>` writes).
 
