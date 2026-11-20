@@ -1,0 +1,2 @@
+# Optional: CycloneDX schema validation of the output.
+cyclonedx-python-lib[json-validation,xml-validation]>=8.0
