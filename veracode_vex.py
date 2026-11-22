@@ -2,10 +2,11 @@
 """Generate VEX documents from a Veracode SCA CycloneDX SBOM and Veracode SCA findings.
 
 Inputs: CycloneDX 1.4-1.6 SBOM (JSON or XML) with a ``vulnerabilities`` section, and
-optionally one or more Findings API exports (``scan_type=SCA&include_annot=TRUE``).
+optionally one or more Findings API exports (``scan_type=SCA&include_annot=TRUE``) and/or
+Reporting API findings reports (SCA mitigation reasons and comments).
 Outputs: standalone CycloneDX VEX (JSON or XML, linked to the SBOM by BOM-Link) or
 OpenVEX 0.2.0 JSON. One statement per CVE x component; mitigations come from the
-findings' approved annotations.
+findings' approved annotations or the report's approved mitigations.
 
 Core is stdlib only; CycloneDX output is schema-validated when
 ``cyclonedx-python-lib[json-validation,xml-validation]`` is installed. No network calls.
@@ -136,6 +137,7 @@ ACTION_ALIASES = {
     "OSENVIRONMENT": "OSENV",
     "LIBRARY": "LIBRARY", "REPORTEDTOLIBRARYMAINTAINER": "LIBRARY",
     "ACCEPTRISK": "ACCEPTRISK", "ACCEPTTHERISK": "ACCEPTRISK", "RISKACCEPTED": "ACCEPTRISK",
+    "ACCEPTRISKS": "ACCEPTRISK", "ACCEPTEDRISK": "ACCEPTRISK",
     "ACCEPTED": "ACCEPTED", "APPROVED": "ACCEPTED", "APPROVE": "ACCEPTED",
     "APPROVEMITIGATION": "ACCEPTED",
     "REJECTED": "REJECTED", "REJECT": "REJECTED", "REJECTMITIGATION": "REJECTED",
@@ -144,6 +146,42 @@ ACTION_ALIASES = {
     "COMMENT": "COMMENT",
 }
 # Other actions (REMEDIATED, NOACTIONTAKEN, CONFORMS, DEVIATES, CUSTOMCLEANSER*) are comments.
+
+# Reporting API values are undocumented: only these spellings (case, space, '_' and '-'
+# ignored) are trusted; anything else is in_triage and listed in --report.
+REPORT_STATUS_ALIASES = {
+    "APPROVED": "APPROVED", "ACCEPTED": "APPROVED", "APPROVE": "APPROVED",
+    "PROPOSED": "PROPOSED", "PENDING": "PROPOSED",
+    "REJECTED": "REJECTED",
+    "NONE": "NONE", "": "NONE", "UNRESOLVED": "NONE",
+}
+REPORT_OPEN_STATUS = {"OPEN": "OPEN", "CLOSED": "CLOSED", "": ""}
+REPORT_STATUS_FIELDS = ("resolution_status", "latest_resolution_status", "mitigation_status")
+# Row fields read as text (usernames, app_name and business_unit are never read).
+REPORT_STR_FIELDS = (
+    "cve_id", "cve_name", "status", "scan_type", "resolution", *REPORT_STATUS_FIELDS,
+    "mitigation_last_proposed_date", "mitigation_last_proposed_comment",
+    "mitigation_last_accepted_date", "mitigation_last_accepted_comment",
+    "mitigation_last_rejected_date", "mitigation_last_rejected_comment",
+    "found_date", "last_found_date", "last_updated_date", "filename", "component_name",
+    "component_version", "component_file_path", "project_name", "sca_agent_issue",
+    "fixed_library_version", "library_latest_safe_version", "policy_rule_passed")
+REPORT_ID_FIELDS = ("app_id", "finding_id", "flaw_id")
+REPORT_KEY = "_veracode_vex_report"  # internal marker on findings built from report rows
+FALSY_FLAGS = ("", "NO", "N", "FALSE", "0", "NONE", "NULL")
+VERSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+:~-]{0,63}", re.ASCII)
+SAME_DAY_NOTE = ("Reporting API: mitigation accepted and rejected with no known order (same day "
+                 "or undated); treated as in triage.")
+REJECTED_LAST_NOTE = ("Reporting API: status is approved but the last mitigation action is a "
+                      "rejection; treated as in triage.")
+UNKNOWN_STATUS_NOTE = ("Reporting API status not recognised or its status fields disagree; "
+                       "treated as in triage.")
+UNKNOWN_REASON_NOTE = ("Veracode mitigation approved; reason not recognised in the Reporting "
+                       "API export; treated as in triage.")
+REPORT_WINDOW_WARNING = (
+    "no --findings: the Reporting API returns only findings with activity in the requested "
+    "window (at most 6 months back), so unchanged findings are missing and their SBOM pairs "
+    "show as no finding (in_triage); add the Findings API export with -f")
 
 # Merge order for several findings on one CVE x component: highest (worst) wins.
 RULE_RANK = {r.label: n for n, r in enumerate(reversed((
@@ -467,6 +505,7 @@ def read_findings(paths: Sequence[str]) -> List[Dict[str, Any]]:
             if str(f.get("scan_type", "SCA")).upper() != "SCA":
                 continue  # SAST/DAST have no CVE x component
             _check_finding_types(path, i, f)
+            f.pop(REPORT_KEY, None)  # internal marker: never taken from input
             key = json.dumps(f, sort_keys=True)
             if key in seen:
                 continue
@@ -498,6 +537,92 @@ def _freshness(f: Dict[str, Any]) -> Tuple[datetime, datetime]:
     st = f.get("finding_status")
     seen = _parse_dt(st.get("last_seen_date")) if isinstance(st, dict) else None
     return max([d for d in dts if d] or [DT_MIN]), seen or DT_MIN
+
+
+def _check_row_types(path: str, i: int, row: Dict[str, Any]) -> None:
+    for k in REPORT_STR_FIELDS:
+        if row.get(k) is not None and not isinstance(row[k], str):
+            raise VexError(f"{path}: rows[{i}].{k} must be a string")
+    for k in REPORT_ID_FIELDS:
+        val = row.get(k)
+        if val is not None and (isinstance(val, bool) or not isinstance(val, (str, int))):
+            raise VexError(f"{path}: rows[{i}].{k} must be a string or an integer")
+
+
+def _report_items(path: str, data: Any, pages: Dict[int, Set[int]]) -> List[Any]:
+    """Rows of one report page; checks the report status and records page metadata."""
+    if not isinstance(data, dict):
+        items = data
+    else:
+        emb = data.get("_embedded")
+        if "_embedded" in data and not isinstance(emb, dict):
+            raise VexError(f"{path}: '_embedded' must be an object")
+        src = emb if isinstance(emb, dict) else data
+        status = src.get("status")
+        if status is not None and not isinstance(status, str):
+            raise VexError(f"{path}: report status must be a string")
+        if isinstance(status, str) and status.strip().upper() != "COMPLETED":
+            raise VexError(f"{path}: report status is {_clean(status)[:40]!r}, not COMPLETED; "
+                           "poll GET /analytics/findings/report/<id> until it completes")
+        items = src.get("findings")
+        page = src.get("page_metadata", data.get("page_metadata", data.get("page")))
+        if isinstance(page, dict):
+            total, number = page.get("total_pages"), page.get("number", 0)
+            if isinstance(total, int) and isinstance(number, int) \
+                    and not isinstance(total, bool) and not isinstance(number, bool):
+                pages.setdefault(total, set()).add(number)
+    if not isinstance(items, list):
+        raise VexError(f"{path}: no findings list (expected a Reporting API findings report)")
+    return items
+
+
+def read_report(paths: Sequence[str]) -> List[Dict[str, Any]]:
+    """Load SCA rows from Reporting API findings reports; duplicates are dropped."""
+    out: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    by_id: Dict[Tuple[str, str], int] = {}
+    pages: Dict[int, Set[int]] = {}
+    apps: Set[str] = set()
+    differ = 0
+    for path in paths:
+        items = _report_items(path, _load_json(_read_text(path), path), pages)
+        for i, row in enumerate(items):
+            if not isinstance(row, dict):
+                raise VexError(f"{path}: rows[{i}] is not an object")
+            _check_row_types(path, i, row)
+            if (row.get("scan_type") or "SCA").strip().upper() != "SCA":
+                continue  # SAST/DAST rows have no CVE x component
+            key = json.dumps(row, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            app = row.get("app_id")
+            if app is not None and str(app):
+                apps.add(str(app))
+            fid = next((str(row[k]) for k in ("finding_id", "flaw_id")
+                        if row.get(k) is not None and str(row[k])), None)
+            if fid is not None:
+                ik = (str(app), fid)
+                if ik in by_id:
+                    differ += 1
+                    j = by_id[ik]
+                    newer = _parse_dt(row.get("last_updated_date")) or DT_MIN
+                    if newer > (_parse_dt(out[j].get("last_updated_date")) or DT_MIN):
+                        out[j] = row  # ties keep the first copy
+                    continue
+                by_id[ik] = len(out)
+            out.append(row)
+    for total, numbers in sorted(pages.items()):
+        if total > len(numbers):
+            print(f"warning: the findings report has {total} pages but {len(numbers)} were "
+                  "passed; pass every page with -r (page==N)", file=sys.stderr)
+    if differ:
+        print(f"warning: {differ} report row(s) repeat an app_id + finding_id with different "
+              "content; kept the copy with the newest last_updated_date", file=sys.stderr)
+    if len(apps) > 1:
+        print(f"warning: the findings report has rows from {len(apps)} applications; request "
+              "it with the app_id of the SBOM's application", file=sys.stderr)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -780,7 +905,7 @@ def classify(finding: Dict[str, Any], comments: bool = True) -> Verdict:
             # Approved, reason unknown: never claim not_affected without the reason.
             v.rule = PROPOSED
             v.notes.append("Veracode mitigation approved; reason not in export "
-                           "(re-export with include_annot=TRUE).")
+                           "(for SCA, add the Reporting API findings report with -r).")
     elif rstatus == "PROPOSED":
         v.rule, v.proposed = PROPOSED, pending
         label = MITIGATIONS[pending].label if pending else "unknown reason"
@@ -800,6 +925,11 @@ def classify(finding: Dict[str, Any], comments: bool = True) -> Verdict:
             text = _annotation_text(ann)
             if text and text not in v.comments:
                 v.comments.append(text)
+    # Reporting API row with an ambiguous or unrecognised outcome: never claim a mitigation.
+    mark = finding.get(REPORT_KEY)
+    triage = mark.get("triage") if isinstance(mark, dict) else None
+    if triage and v.rule is not CLOSED:
+        v.rule, v.mitigation, v.notes = PROPOSED, None, [triage]
     return v
 
 
@@ -807,7 +937,186 @@ def approved_without_history(findings: List[Dict[str, Any]]) -> int:
     """APPROVED findings with no annotations that end up in triage (reason unknown)."""
     return sum(1 for f in findings
                if str((f.get("finding_status") or {}).get("resolution_status") or "").upper()
-               == "APPROVED" and not f.get("annotations") and classify(f, False).rule is PROPOSED)
+               == "APPROVED" and not f.get("annotations") and classify(f, False).rule is PROPOSED
+               and not (f.get(REPORT_KEY) or {}).get("row"))
+
+
+# --------------------------------------------------------------------------- #
+# Reporting API rows
+# --------------------------------------------------------------------------- #
+
+
+def _norm_key(val: Any) -> str:
+    return re.sub(r"[\s_-]", "", val.upper()) if isinstance(val, str) else ""
+
+
+def _row_text(row: Dict[str, Any], key: str) -> str:
+    val = row.get(key)
+    return val.strip() if isinstance(val, str) else ""
+
+
+def _row_status(row: Dict[str, Any], unknown: Counter) -> Optional[str]:
+    """APPROVED/PROPOSED/REJECTED/NONE from the row's status fields; None if unknown or mixed."""
+    found: List[str] = []
+    ok = True
+    for k in REPORT_STATUS_FIELDS:
+        raw = _row_text(row, k)
+        if not raw:
+            continue
+        norm = REPORT_STATUS_ALIASES.get(_norm_key(raw))
+        if norm is None:
+            unknown[(k, raw[:60])] += 1
+            ok = False
+        else:
+            found.append(norm)
+    if ok and len(set(found)) > 1:
+        unknown[("status fields disagree", " / ".join(sorted(set(found))))] += 1
+        ok = False
+    return (found[0] if found else "NONE") if ok else None
+
+
+def _row_date(row: Dict[str, Any], key: str) -> Optional[str]:
+    """Calendar date of a row timestamp (the API sends dates; EDT, so no time zone math)."""
+    dt = _parse_dt(row.get(key))
+    return f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}" if dt else None
+
+
+def row_to_finding(row: Dict[str, Any], comments: bool, unknown: Counter) -> Dict[str, Any]:
+    """Findings-API-shaped SCA finding from one Reporting API row (usernames never read)."""
+    rstatus = _row_status(row, unknown)
+    raw_status = _row_text(row, "status")
+    status = REPORT_OPEN_STATUS.get(_norm_key(raw_status))
+    if status is None:
+        unknown[("status", raw_status[:60])] += 1
+    resolution = _row_text(row, "resolution")
+    action = _norm_action(resolution)
+    reason = action if action in MITIGATIONS else None
+    triage = None if rstatus is not None and status is not None else UNKNOWN_STATUS_NOTE
+    if rstatus in ("APPROVED", "PROPOSED") and reason is None:
+        unknown[("resolution", resolution[:60] or "(empty)")] += 1
+        if rstatus == "APPROVED":
+            triage = triage or UNKNOWN_REASON_NOTE
+
+    # Last proposal / acceptance / rejection, replayed by classify() like annotations.
+    events: Dict[str, Dict[str, Optional[str]]] = {}
+    for kind in ("proposed", "accepted", "rejected"):
+        date = _row_date(row, f"mitigation_last_{kind}_date")
+        text = _row_text(row, f"mitigation_last_{kind}_comment") if comments else ""
+        if date or text:
+            events[kind] = {"created": date, "comment": text or None}
+    acc, rej = events.get("accepted"), events.get("rejected")
+    if acc and rej:
+        a, r = acc["created"], rej["created"]
+        if not a or not r or a == r:
+            triage = triage or SAME_DAY_NOTE
+        elif rstatus == "APPROVED" and r > a:
+            triage = triage or REJECTED_LAST_NOTE
+    anns: List[Dict[str, Any]] = []
+    if reason and (events or rstatus in ("APPROVED", "PROPOSED")):
+        anns.append({"action": reason, **events.get("proposed", {})})  # same day: first
+    if acc:
+        anns.append({"action": "APPROVED", **acc})
+    elif rstatus == "APPROVED" and reason and not rej:
+        anns.append({"action": "APPROVED"})  # status says approved; no dated acceptance
+    if rej:
+        anns.append({"action": "REJECTED", **rej})
+    anns = [{k: v for k, v in a.items() if v is not None} for a in anns]
+
+    path = _row_text(row, "component_file_path")
+    agent = _row_text(row, "project_name") or \
+        _norm_key(row.get("sca_agent_issue")) not in FALSY_FLAGS
+    fixed = next((v for v in (_row_text(row, "fixed_library_version"),
+                              _row_text(row, "library_latest_safe_version"))
+                  if VERSION_RE.fullmatch(v)), None)
+    details: Dict[str, Any] = {
+        "cve": {"name": _row_text(row, "cve_name") or _row_text(row, "cve_id") or None},
+        "component_filename": _row_text(row, "filename") or _row_text(row, "component_name"),
+        "version": _row_text(row, "component_version"),
+        "metadata": {"sca_scan_mode": "AGENT" if agent else "UPLOAD"}}
+    if path:
+        details["component_path"] = [{"path": path}]
+    st: Dict[str, Any] = {"status": status or "",
+                          "resolution": re.sub(r"[^A-Z0-9]+", "_", resolution.upper()).strip("_")}
+    if rstatus:
+        st["resolution_status"] = rstatus
+    for src, dst in (("found_date", "first_found_date"), ("last_found_date", "last_seen_date")):
+        if _row_date(row, src):
+            st[dst] = _row_date(row, src)
+    f: Dict[str, Any] = {"scan_type": "SCA", "finding_status": st, "finding_details": details,
+                         REPORT_KEY: {"row": True, "status": rstatus, "triage": triage,
+                                      "fixed": fixed}}
+    if anns:
+        f["annotations"] = anns
+    policy = _norm_key(row.get("policy_rule_passed"))
+    if policy in ("YES", "NO"):
+        f["violates_policy"] = policy == "NO"
+    return f
+
+
+def rows_to_findings(rows: List[Dict[str, Any]],
+                     comments: bool) -> Tuple[List[Dict[str, Any]], Counter]:
+    """Convert report rows; returns (findings, unrecognised (field, value) counts)."""
+    unknown: Counter = Counter()
+    return [row_to_finding(r, comments, unknown) for r in rows], unknown
+
+
+@dataclass
+class RowUse:
+    """How report rows were combined with Findings API findings."""
+
+    findings: List[Dict[str, Any]]
+    unmatched: List[str] = field(default_factory=list)
+    disagree: List[str] = field(default_factory=list)
+
+
+def combine_report(bom: Dict[str, Any], findings: List[Dict[str, Any]],
+                   rows: List[Dict[str, Any]]) -> RowUse:
+    """Findings API findings, with the reason/comments of agreeing report rows attached."""
+    index = SbomIndex(bom)
+    by_pair: Dict[Tuple[str, str], List[int]] = {}
+    for n, r in enumerate(rows):
+        cve = _cve_name(r)
+        for ref in index.match(r) if cve else set():
+            by_pair.setdefault((str(cve), ref), []).append(n)
+    used: Set[int] = set()
+    out = RowUse(findings=[])
+    for f in findings:
+        cve, mode = _cve_name(f), _scan_mode(f)
+        refs = index.match(f) if cve else set()
+        cands = sorted({n for ref in refs for n in by_pair.get((str(cve), ref), [])
+                        if not mode or _scan_mode(rows[n]) in ("", mode)})
+        if not cands:
+            out.findings.append(f)
+            continue
+        used.update(cands)
+        marks = [rows[n][REPORT_KEY] for n in cands]
+        g = dict(f)  # never mutate the caller's finding
+        mark: Dict[str, Any] = {}
+        fixed = {m["fixed"] for m in marks} - {None}
+        if len(fixed) == 1:
+            mark["fixed"] = fixed.pop()
+        if not f.get("annotations"):
+            fst = REPORT_STATUS_ALIASES.get(_norm_key(
+                (f.get("finding_status") or {}).get("resolution_status") or ""))
+            known = [(n, rows[n][REPORT_KEY]) for n in cands
+                     if rows[n][REPORT_KEY]["status"] is not None]
+            other = sorted({m["status"] for _, m in known if m["status"] != fst})
+            agree = [n for n, m in known if m["status"] == fst]
+            variants = {json.dumps([rows[n].get("annotations"), rows[n][REPORT_KEY]["triage"]],
+                                   sort_keys=True) for n in agree}
+            if other or len(variants) > 1:
+                what = f"report {', '.join(other)}" if other else "report rows differ"
+                out.disagree.append(f"{_finding_label(f)}: Findings API {fst or '?'}, {what}")
+            elif agree:
+                src = rows[agree[0]]
+                if src.get("annotations"):
+                    g["annotations"] = src["annotations"]
+                mark["triage"] = src[REPORT_KEY]["triage"]
+        if mark:
+            g[REPORT_KEY] = mark
+        out.findings.append(g)
+    out.unmatched = [_finding_label(r) for n, r in enumerate(rows) if n not in used]
+    return out
 
 
 def merge(verdicts: List[Verdict]) -> Tuple[Verdict, bool]:
@@ -856,6 +1165,7 @@ class Pair:
     verdict: Verdict
     finding: Optional[Dict[str, Any]] = None  # a representative finding (EPSS etc.)
     private: bool = False  # --no-comments: properties carry no free text
+    fixed: Optional[str] = None  # fixed library version from the Reporting API
 
 
 @dataclass
@@ -875,6 +1185,10 @@ class Report:
     statements: int = 0
     warnings: List[str] = field(default_factory=list)
     trimmed: bool = False  # SBOM came from sbom_trim: never name findings it does not list
+    report_rows: int = 0  # Reporting API rows read (after dedupe)
+    rows_unmatched: List[str] = field(default_factory=list)
+    rows_disagree: List[str] = field(default_factory=list)
+    unknown_values: Counter = field(default_factory=Counter)  # (field, value) -> rows
 
     def format(self, fmt: str) -> str:
         lines = [f"VEX ({fmt}): {self.statements} statements, "
@@ -882,6 +1196,8 @@ class Report:
         for state, n in sorted(self.states.items()):
             lines.append(f"  {state:<22}{n}")
         lines.append(f"Findings: {self.findings_total} read, {self.findings_matched} matched")
+        if self.report_rows:
+            lines.append(f"Reporting API rows: {self.report_rows} read")
         if self.pairs_without_finding:
             lines.append(f"  {self.pairs_without_finding} SBOM pairs had no finding (in_triage)")
         unmatched = (
@@ -891,7 +1207,10 @@ class Report:
             ("Ambiguous findings: file name fits several packages (not applied)",
              self.findings_ambiguous),
             ("Findings whose version differs from the SBOM component at that path",
-             self.findings_wrong_version))
+             self.findings_wrong_version),
+            ("Report rows with no matching finding (not used)", self.rows_unmatched),
+            ("Reporting API row disagrees with Findings API (Findings API used)",
+             self.rows_disagree))
         for title, items in unmatched + (("Conflicting findings (worst state used)",
                                           self.conflicts),):
             if not items:
@@ -903,6 +1222,11 @@ class Report:
             lines.extend(f"  {x}" for x in items[:20])
             if len(items) > 20:
                 lines.append(f"  ... {len(items) - 20} more")
+        if self.unknown_values:
+            lines.append(f"Unrecognised Reporting API values (rows kept in_triage): "
+                         f"{len(self.unknown_values)}")
+            for (name, val), n in sorted(self.unknown_values.items()):
+                lines.append(f"  {name} {_clean(val)!r}: {n}")
         lines.extend(f"Note: {w}" for w in self.warnings)
         return "\n".join(lines)
 
@@ -943,6 +1267,13 @@ def is_trimmed(bom: Dict[str, Any]) -> bool:
         return True
     return any(_prop(c, REDACTED_PROPERTY) or REDACTED_REF_RE.match(str(c.get("bom-ref", "")))
                for c in iter_components(all_components(bom)))
+
+
+def _one_fixed(findings: Iterator[Dict[str, Any]]) -> Optional[str]:
+    """The fixed version the report rows agree on for a pair; None when absent or mixed."""
+    found = {m.get("fixed") for m in (f.get(REPORT_KEY) for f in findings)
+             if isinstance(m, dict)} - {None}
+    return found.pop() if len(found) == 1 else None
 
 
 def merge_vuln_records(records: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1037,7 +1368,8 @@ def correlate(bom: Dict[str, Any], findings: List[Dict[str, Any]],
         # Prefer a finding with EPSS data for the properties.
         rep = next((e[1] for e in entries
                     if (_details(e[1]).get("cve") or {}).get("exploitability")), entries[0][1])
-        pairs.append(Pair(vid, ref, verdict, rep, private=not comments))
+        pairs.append(Pair(vid, ref, verdict, rep, private=not comments,
+                          fixed=_one_fixed(e[1] for e in entries)))
     for p in pairs:
         report.states[p.verdict.rule.cdx_state] += 1
     return pairs, base, report
@@ -1102,6 +1434,8 @@ def _vuln_props(pair: Pair, v: Verdict) -> List[Dict[str, str]]:
         if "violates_policy" in pair.finding:
             props.append({"name": "veracode:violates_policy",
                           "value": str(bool(pair.finding["violates_policy"])).lower()})
+    if pair.fixed and v.rule in (OPEN, MITIGATIONS["DEFER"]):
+        props.append({"name": "veracode:fixed_version", "value": pair.fixed})
     return props
 
 
@@ -1329,13 +1663,20 @@ def cdx_to_xml(vex: Dict[str, Any], indent: int = 2) -> str:
 def _ov_action(pair: Pair, comp: Dict[str, Any]) -> str:
     rule = pair.verdict.rule
     who = "@".join(x for x in (comp.get("name"), comp.get("version")) if isinstance(x, str))
+    name = comp.get("name") if isinstance(comp.get("name"), str) and comp["name"] else None
+    # Reporting API fixed_library_version (else latest safe version), never latest version.
+    fix = f"{name or 'the component'} to {pair.fixed} or later" if pair.fixed else None
     if rule is MITIGATIONS["ACCEPTRISK"]:
         return "Risk accepted after review in Veracode; no fix planned."
     if rule is MITIGATIONS["LIBRARY"]:
         return "Reported to the library maintainer; no fixed version available yet."
     if rule is MITIGATIONS["DEFER"]:
+        if fix:
+            return f"Remediation deferred after review in Veracode; update {fix} when scheduled."
         return (f"Remediation deferred after review in Veracode; update {who or 'the component'} "
                 f"to a version not affected by {pair.vuln_id} when scheduled.")
+    if fix and rule is OPEN:
+        return f"Update {fix}."
     return f"Update {who or 'the component'} to a version not affected by {pair.vuln_id}."
 
 
@@ -1380,7 +1721,9 @@ def build_openvex(bom: Dict[str, Any], pairs: List[Pair], base: Dict[str, Dict[s
         if conflict:
             report.conflicts.append(f"{vid} {pid}")
         rep = next((q for q in ps if q.finding), ps[0])
-        items.append((pid, Pair(vid, rep.ref, verdict, rep.finding)))
+        fixes = {q.fixed for q in ps}
+        items.append((pid, Pair(vid, rep.ref, verdict, rep.finding,
+                                fixed=fixes.pop() if len(fixes) == 1 else None)))
 
     for (vid, status, just, text, action), group in _group(items, key).items():
         prods: List[Dict[str, Any]] = []
@@ -1641,6 +1984,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("sbom", help="CycloneDX JSON or XML SBOM from Veracode, with vulnerabilities")
     p.add_argument("-f", "--findings", action="append", default=[], metavar="FILE",
                    help="Findings API export (scan_type=SCA&include_annot=TRUE); repeat per page")
+    p.add_argument("-r", "--report-findings", action="append", default=[], metavar="FILE",
+                   help="Reporting API findings report (scan_type SCA, status COMPLETED): SCA "
+                        "mitigation reasons and comments; repeat per page")
     p.add_argument("-o", "--output", required=True, help="output path (never an input)")
     p.add_argument("--format", choices=("cyclonedx", "openvex"), default="cyclonedx",
                    help="VEX format (default cyclonedx)")
@@ -1676,20 +2022,32 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         if args.format == "openvex" and args.output_format == "xml":
             raise VexError("OpenVEX is JSON only; drop --output-format xml")
-        for src in [args.sbom] + args.findings:
+        for src in [args.sbom] + args.findings + args.report_findings:
             if _same_file(src, args.output):
                 raise VexError("--output must differ from every input file")
         bom = read_sbom(args.sbom)
         findings = read_findings(args.findings)
-        if not args.findings:
+        rows, unknown = rows_to_findings(read_report(args.report_findings),
+                                         comments=not args.no_comments)
+        use = RowUse(findings=findings)
+        if args.report_findings and args.findings:
+            use = combine_report(bom, findings, rows)
+        elif args.report_findings:
+            use = RowUse(findings=rows)
+            print(f"warning: {REPORT_WINDOW_WARNING}", file=sys.stderr)
+        elif not args.findings:
             print("warning: no --findings; every statement is in_triage/under_investigation",
                   file=sys.stderr)
+        findings = use.findings
         blind = approved_without_history(findings)
         if blind:
             print(f"warning: {blind} approved findings have no mitigation details; the Findings "
                   "API does not return annotations for SCA (include_annot is not valid for SCA "
-                  "per the API spec), so they are reported as in_triage", file=sys.stderr)
+                  "per the API spec), so they are reported as in_triage; add the Reporting API "
+                  "findings report with -r for their reasons", file=sys.stderr)
         pairs, base, report = correlate(bom, findings, comments=not args.no_comments)
+        report.report_rows, report.unknown_values = len(rows), unknown
+        report.rows_unmatched, report.rows_disagree = use.unmatched, use.disagree
         indent = max(args.indent, 0)
         if args.format == "openvex":
             doc = build_openvex(bom, pairs, base, report, args.author, args.product)
