@@ -17,6 +17,7 @@ Turns a Veracode SCA SBOM plus your Veracode SCA findings into a VEX document: o
 
 - SBOM: CycloneDX 1.4–1.6, JSON or XML, from the Veracode SBOM REST API (`type=application` / `type=agent`), with its `vulnerabilities` section. SPDX is rejected.
 - Findings: Findings REST API export with `scan_type=SCA&include_annot=TRUE` (SCA must be the only scan type). Pass every page (`-f` is repeatable); a finding repeated across pages (same `context_guid` and `issue_id`) is kept once, using the copy with the newest annotation or `last_seen_date`, with a warning when the copies differ. Without findings every statement is `in_triage` / `under_investigation`.
+- Findings report (optional): Reporting API findings report (`scan_type` `SCA`) with `-r` (repeatable, one file per page). It carries the SCA mitigation reason and the last proposal, acceptance and rejection comments, which the Findings API does not return for SCA. Accepted shapes: the `GET .../report/<id>` response, `{"findings": [...]}` or a bare list; v1 (`/appsec/v1/analytics/report`) responses have the same rows. A report whose `status` is not `COMPLETED` is rejected; a warning is printed when the page metadata lists more pages than were passed.
 - Scope: findings default to the latest policy scan; add `context=<sandbox_guid>` for a sandbox. Export the SBOM and findings from the same app and scan context.
 - Output: CycloneDX VEX (JSON or XML, same spec version as the SBOM) or OpenVEX 0.2.0 (JSON). Inputs are never overwritten.
 - Encoding: UTF-8, or UTF-16/32 with a BOM (what PowerShell `>` writes).
@@ -35,6 +36,16 @@ http --auth-type=veracode_hmac --check-status GET \
 http --auth-type=veracode_hmac --check-status GET \
   "https://api.veracode.com/appsec/v2/applications/<APP_GUID>/findings" \
   scan_type==SCA include_annot==TRUE size==500 -o app_findings.json
+
+# SCA mitigation reasons and comments: Reporting API findings report.
+# input.json (the start date may be at most 6 months back; app_id is the numeric
+# application id, the Applications API "id", not the GUID):
+#   {"last_updated_start_date": "<date 6 months ago> 00:00:00", "app_id": <APP_ID>, "scan_type": ["SCA"]}
+http --auth-type=veracode_hmac --check-status POST \
+  "https://api.veracode.com/analytics/findings/report" < input.json   # returns the report id
+# Repeat until _embedded.status is COMPLETED, then save every page (page==0, 1, ...)
+http --auth-type=veracode_hmac --check-status GET \
+  "https://api.veracode.com/analytics/findings/report/<REPORT_ID>" page==0 -o app_report_p0.json
 ```
 
 ## Install
@@ -62,6 +73,10 @@ python veracode_vex.py app_sbom.json -f app_findings.json -o app.openvex.json \
 
 # Several findings pages; leave free-text mitigation comments out of the VEX
 python veracode_vex.py app_sbom.json -f page0.json -f page1.json -o app.vex.json --no-comments
+
+# Findings plus the Reporting API findings report (SCA mitigation reasons and comments)
+python veracode_vex.py app_sbom.json -f app_findings.json -r app_report_p0.json -r app_report_p1.json \
+  -o app.vex.json --report
 
 # Publish only what you ship: trim first, then generate VEX on the trimmed SBOM
 python sbom_trim.py app_sbom.json -o app_sbom.trimmed.json --public-only --exclude 'pkg:maven/com.acme/*'
@@ -97,6 +112,17 @@ python veracode_vex.py app_sbom.trimmed.json -f app_findings.json -o app.vex.jso
 - OpenVEX has one status per CVE × product `@id`: SBOM components that share a purl are merged first (worst outcome wins, as above), and the check rejects a CVE × product listed in two statements.
 - OpenVEX CISA fields: each statement has `version` 1, `timestamp` (first issued: the first mitigation proposal, else the first-found date, else the run time) and `last_updated` (newest annotation); the document `last_updated` is the newest statement update. A document with no statements fails the check (exit 3).
 
+## Reporting API findings report (`-r`)
+
+The Findings API does not return SCA mitigation reasons or comments, so an approved SCA mitigation from `-f` alone stays `in_triage`. The Reporting API findings report has them.
+
+- Each SCA row becomes a finding: `cve_name` (else `cve_id`), `filename` (else `component_name`), `component_version`, `component_file_path` (matched like a Findings API `component_path`), agent scan when `project_name` or `sca_agent_issue` is set. The reason comes from `resolution`, the history from `mitigation_last_proposed_*`, `mitigation_last_accepted_*` and `mitigation_last_rejected_*` (date and comment; usernames, `app_name` and `business_unit` are never read). Dates are calendar dates; on one day a proposal comes before its acceptance or rejection. An acceptance older than the last proposal means the mitigation was proposed again and is pending (`in_triage`). Accepted and rejected on the same day (or without dates), or an approved status whose last action is a rejection, is `in_triage`.
+- Veracode does not document the values of `resolution`, `resolution_status`, `latest_resolution_status` or `mitigation_status`. Reasons are recognised by their Veracode UI labels (Potential False Positive, Mitigated by Design, Mitigated by Network Environment, Mitigated by OS Environment, Reported to Library Maintainer, Accept the Risk / Risk Accepted; case, spaces and `_` ignored). Statuses: `APPROVED`/`ACCEPTED` approved, `PROPOSED`/`PENDING` proposed, `REJECTED` rejected, `NONE`/`UNRESOLVED`/empty none. Every non-empty status field must be recognised and agree. Anything else stays `in_triage`, and `--report` lists the distinct values under *Unrecognised Reporting API values* so you can see what Veracode sends.
+- With `-f`: the Findings API export is the source of truth for the current status. A report row is used for a finding with the same CVE, an overlapping SBOM component and the same scan mode. When the finding has no annotations and its `resolution_status` agrees with the row, the row's reason and comments are applied. When they disagree the Findings API status is kept and `--report` lists the finding under *Reporting API row disagrees with Findings API*. Rows that match no finding are listed under *Report rows with no matching finding* and not used.
+- Without `-f`: the rows are the findings. The report only returns findings with activity in the requested window (at most 6 months back), so findings without recent activity are missing and their SBOM pairs appear as *no finding* (`in_triage`); a warning says so.
+- `fixed_library_version` (else `library_latest_safe_version`, never `library_latest_version`) on an open or deferred pair sets `veracode:fixed_version` and the OpenVEX action statement "Update <name> to <version> or later".
+- Rows repeated across pages are dropped; rows with the same `app_id` and `finding_id` (or `flaw_id`) keep the newest `last_updated_date`. `--no-comments` drops the report comments too.
+
 ## Matching findings to SBOM components
 
 Components are the SBOM `components` plus `metadata.component`, nested ones included.
@@ -114,6 +140,7 @@ Rules 2 and 3 apply only when rule 1 finds nothing. When the SBOM repeats a vuln
 | Option | Effect |
 |---|---|
 | `-f, --findings FILE` | Findings API export; repeat per page |
+| `-r, --report-findings FILE` | Reporting API findings report (`COMPLETED`); repeat per page; with or without `-f` |
 | `-o, --output PATH` | Output file (required; never an input) |
 | `--format cyclonedx\|openvex` | VEX format (default `cyclonedx`) |
 | `--output-format json\|xml` | CycloneDX serialization (default `json`) |
@@ -132,6 +159,7 @@ CycloneDX JSON validation checks `uniqueItems` with a hash set (linear time; the
 ## Limitations
 
 - CycloneDX VEX needs the SBOM `serialNumber` (BOM-Link). OpenVEX works without it when components have purls.
-- Veracode SCA findings do not carry fixed versions, so `affected` action statements say to update to a non-affected version.
+- Veracode SCA findings do not carry fixed versions, so `affected` action statements say to update to a non-affected version, unless a Reporting API row gives `fixed_library_version` or `library_latest_safe_version`.
 - Statements reflect the findings export at the time it was taken; re-run after new scans or mitigation decisions.
-- The Findings API spec says `include_annot` is not valid for SCA, and SCA exports seen so far carry no annotations. Approved SCA findings without annotations are reported as `in_triage` and the tool prints a warning with their count. Reading mitigation reasons from the Reporting API v2 (which has SCA mitigation fields) is planned.
+- The Findings API spec says `include_annot` is not valid for SCA, and SCA exports seen so far carry no annotations. Approved SCA findings without annotations are reported as `in_triage` and the tool prints a warning with their count; add the Reporting API findings report (`-r`) for their reasons and comments.
+- The Reporting API value spellings are not documented; the recognised spellings are based on Veracode UI labels and have not been checked against a live export. Run with `--report` and check *Unrecognised Reporting API values*.
